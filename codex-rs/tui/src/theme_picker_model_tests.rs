@@ -26,7 +26,6 @@ fn model_theme_files_preview_select_and_restore() {
         );
         return;
     }
-    let original = highlight::current_syntax_theme();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let tx = AppEventSender::new(tx);
     let mut snapshot = String::new();
@@ -86,7 +85,10 @@ fn model_theme_files_preview_select_and_restore() {
                 rx.try_recv().unwrap(),
                 AppEvent::SyntaxThemePreviewed
             ));
-            assert_eq!(highlight::current_syntax_theme(), original);
+            assert_eq!(
+                Some(highlight::current_syntax_theme()),
+                highlight::resolve_theme_by_name(name, /*codex_home*/ None)
+            );
         });
     }
     insta::assert_snapshot!(snapshot);

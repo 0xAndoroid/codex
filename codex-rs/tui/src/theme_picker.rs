@@ -137,6 +137,9 @@ const PREVIEW_FRAME_PADDING: u16 = 1;
 
 const PREVIEW_FALLBACK_SUBTITLE: &str = "Move up/down to live preview themes";
 
+/// Identifies the open `/theme` picker, whose live preview a palette change must not replace.
+pub(crate) const THEME_PICKER_VIEW_ID: &str = "theme-picker";
+
 /// Side-by-side preview: syntax-highlighted Rust diff snippet, vertically
 /// centered with a 2-column left inset.  Fills the entire side panel height.
 struct ThemePreviewWideRenderable;
@@ -302,7 +305,8 @@ fn theme_picker_subtitle(codex_home: Option<&Path>, terminal_width: Option<u16>)
 /// Builds [`SelectionViewParams`] for the `/theme` picker dialog.
 ///
 /// Lists all bundled themes plus custom `.tmTheme` files, with live preview
-/// on cursor movement and cancel-restore.
+/// on cursor movement. Cancel restores the persisted preference, resolved
+/// against the terminal palette at that moment.
 ///
 /// `current_name` should be the value of `Config::tui_theme` (the persisted
 /// preference).  When it names a theme that is currently available the picker
@@ -314,9 +318,6 @@ pub(crate) fn build_theme_picker_params(
     codex_home: Option<&Path>,
     terminal_width: Option<u16>,
 ) -> SelectionViewParams {
-    // Snapshot the current theme so we can restore on cancel.
-    let original_theme = highlight::current_syntax_theme();
-
     let entries = highlight::list_available_themes(codex_home);
     let codex_home_owned = codex_home.map(Path::to_path_buf);
 
@@ -380,10 +381,22 @@ pub(crate) fn build_theme_picker_params(
     )
         as Box<dyn Fn(usize, &crate::app_event_sender::AppEventSender) + Send + Sync>);
 
-    // Restore original theme on cancel.
+    // The palette may have changed while the picker was open, so an adaptive preference is
+    // resolved again instead of restoring the theme that was active when the picker opened.
+    let saved_name = current_name.map(str::to_string);
+    let cancel_home = codex_home_owned.clone();
     let on_cancel = Some(
         Box::new(move |tx: &crate::app_event_sender::AppEventSender| {
-            highlight::set_syntax_theme(original_theme.clone());
+            let home = cancel_home.as_deref();
+            if let Some(theme) = saved_name
+                .as_deref()
+                .and_then(|name| highlight::resolve_theme_by_name(name, home))
+                .or_else(|| {
+                    highlight::resolve_theme_by_name(highlight::adaptive_default_theme_name(), home)
+                })
+            {
+                highlight::set_syntax_theme(theme);
+            }
             tx.send(AppEvent::SyntaxThemePreviewed);
         }) as Box<dyn Fn(&crate::app_event_sender::AppEventSender) + Send + Sync>,
     );
@@ -405,6 +418,7 @@ pub(crate) fn build_theme_picker_params(
         preserve_side_content_bg: true,
         on_selection_changed,
         on_cancel,
+        view_id: Some(THEME_PICKER_VIEW_ID),
         ..SelectionViewParams::picker()
     }
 }
@@ -622,6 +636,39 @@ mod tests {
             .expect("expected search value to contain canonical theme name");
 
         assert_eq!(selected_name, configured_or_default_theme);
+    }
+
+    #[test]
+    fn cancel_resolves_the_saved_preference_against_the_current_palette() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::app_event_sender::AppEventSender::new(tx);
+        let dark = crate::terminal_probe::DefaultColors {
+            fg: (224, 224, 224),
+            bg: (24, 24, 24),
+        };
+        let light = crate::terminal_probe::DefaultColors {
+            fg: (32, 32, 32),
+            bg: (255, 255, 255),
+        };
+        let (adaptive, explicit) = crate::terminal_palette::with_test_default_colors(dark, || {
+            let open = |name| build_theme_picker_params(name, /*codex_home*/ None, Some(120));
+            (open(None), open(Some("dracula")))
+        });
+
+        let cancelled = crate::terminal_palette::with_test_default_colors(light, || {
+            [adaptive, explicit].map(|params| {
+                params.on_cancel.as_ref().expect("cancel handler")(&tx);
+                highlight::current_syntax_theme().name
+            })
+        });
+
+        assert_eq!(
+            cancelled,
+            ["catppuccin-latte", "dracula"].map(|name| {
+                highlight::resolve_theme_by_name(name, /*codex_home*/ None)
+                    .and_then(|theme| theme.name)
+            })
+        );
     }
 }
 
