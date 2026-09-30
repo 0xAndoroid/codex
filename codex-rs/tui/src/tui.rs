@@ -84,6 +84,8 @@ mod size_monitor;
 #[cfg(all(test, unix))]
 #[path = "tui_startup_tests.rs"]
 mod startup_tests;
+#[cfg(unix)]
+mod terminal_colors;
 mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -259,6 +261,8 @@ pub fn set_modes() -> Result<()> {
     let _ = execute!(stdout(), EnableFocusChange);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), terminal_colors::EnableColorSchemeReports);
     Ok(())
 }
 
@@ -347,6 +351,8 @@ fn restore_common(
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), terminal_colors::DisableColorSchemeReports);
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
     {
@@ -995,6 +1001,8 @@ impl Tui {
         }
 
         self.resume_events();
+        // Mode 2031 was off while the external program ran, so re-read the palette.
+        self.event_broker.request_default_colors();
         self.schedule_screen_size_recheck(Duration::ZERO);
         output
     }

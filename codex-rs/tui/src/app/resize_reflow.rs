@@ -430,6 +430,14 @@ impl App {
         tui: &mut tui::Tui,
         size: ratatui::layout::Size,
     ) -> Result<()> {
+        if self
+            .transcript_reflow
+            .note_palette(crate::terminal_palette::default_colors())
+        {
+            // History and the adaptive syntax theme were rendered for the old terminal colors.
+            self.restore_runtime_theme_from_config();
+            self.schedule_immediate_resize_reflow(tui);
+        }
         self.flush_native_history(tui);
         if tui.is_owned_screen() {
             let width = self.transcript_reflow.note_width(size.width);

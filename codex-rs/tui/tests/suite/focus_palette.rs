@@ -21,6 +21,7 @@ use tempfile::TempDir;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 const FOCUS_PROBE_INPUT: &str = "focus-palette-24527";
+const PALETTE_PROBE_INPUT: &str = "q8x";
 
 #[path = "external_editor_tests.rs"]
 mod external_editor;
@@ -36,18 +37,84 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
     terminal.wait_for_startup()?;
 
-    let startup_output_len = terminal.output.len();
+    let focus_output_start = terminal.output.len();
     let focus_started = Instant::now();
     terminal.write_input(format!("\u{1b}[I{FOCUS_PROBE_INPUT}").as_bytes())?;
-    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, focus_output_start)?;
 
     let delayed_input = format!("{FOCUS_PROBE_INPUT}-delayed");
+    let delayed_focus_output_start = terminal.output.len();
     let delayed_focus_started = Instant::now();
     terminal.write_input(b"\x1b[I")?;
     terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
     terminal.write_input(delayed_input.as_bytes())?;
-    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(
+        &delayed_input,
+        delayed_focus_started,
+        delayed_focus_output_start,
+    )?;
 
+    Ok(())
+}
+
+#[test]
+fn color_scheme_report_refreshes_palette_without_dropping_input() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempfile::tempdir()?;
+    write_test_config(codex_home.path(), &repo_root)?;
+
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
+    terminal.wait_for_startup()?;
+    ensure!(
+        contains_bytes(&terminal.output, b"\x1b[?2031h"),
+        "startup did not enable color-scheme reports"
+    );
+    terminal.write_input(PALETTE_PROBE_INPUT.as_bytes())?;
+    terminal.wait_for_screen(PALETTE_PROBE_INPUT)?;
+    let dark_fill = terminal
+        .background_at(PALETTE_PROBE_INPUT)
+        .context("find the composer probe text")?;
+
+    let report_output_start = terminal.output.len();
+    terminal.write_input(b"\x1b[?997;2n")?;
+    let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+    while !contains_bytes(&terminal.output[report_output_start..], b"\x1b]11;?") {
+        ensure!(
+            Instant::now() < deadline,
+            "color-scheme report did not re-query terminal colors"
+        );
+        terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
+    }
+
+    // Reply with a light palette byte by byte, with typed keys between the replies.
+    for chunk in [
+        b"d".as_slice(),
+        b"\x1b]10;rgb:0000/0000/0000\x1b\\",
+        b"e",
+        b"\x1b]11;rgb:ffff/ffff/ffff\x07",
+        b"f",
+    ] {
+        for byte in chunk {
+            terminal.write_input(std::slice::from_ref(byte))?;
+        }
+    }
+    let typed = format!("{PALETTE_PROBE_INPUT}def");
+    let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+    while !(terminal.screen_contains(&typed)
+        && terminal.background_at(PALETTE_PROBE_INPUT) != Some(dark_fill))
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "palette replies did not refresh the composer fill ({dark_fill:?}); screen:\n{}",
+            terminal.screen_contents()
+        );
+        terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
+    }
+    ensure!(
+        !terminal.screen_contains("rgb:") && !terminal.screen_contains("?997"),
+        "terminal replies leaked into the screen:\n{}",
+        terminal.screen_contents()
+    );
     Ok(())
 }
 
@@ -411,28 +478,32 @@ impl PtyCodex {
         );
     }
 
+    /// Wait for input typed after a focus report while its palette queries stay unanswered.
+    ///
+    /// Focus regain re-queries the palette without waiting for the reply, so the queries must be
+    /// written and the input must still arrive.
     fn wait_for_focus_input(
         &mut self,
         input: &str,
         focus_started: Instant,
-        startup_output_len: usize,
+        focus_output_start: usize,
     ) -> Result<()> {
         while focus_started.elapsed() < FOCUS_INPUT_TIMEOUT {
             self.read_output(Duration::from_millis(/*millis*/ 20))?;
-            let focus_output = &self.output[startup_output_len..];
-            ensure!(
-                !contains_bytes(focus_output, b"\x1b]10;?")
-                    && !contains_bytes(focus_output, b"\x1b]11;?"),
-                "focus regain queried terminal colors after the startup palette was cached",
-            );
             if self.screen_contains(input) {
+                let focus_output = &self.output[focus_output_start..];
+                ensure!(
+                    contains_bytes(focus_output, b"\x1b]10;?")
+                        && contains_bytes(focus_output, b"\x1b]11;?"),
+                    "focus regain did not re-query terminal colors",
+                );
                 return Ok(());
             }
         }
 
         bail!(
-            "focus-time palette refresh blocked or discarded {input:?} for more than {:?}; \
-             screen:\n{}",
+            "unanswered focus-time palette queries blocked or discarded {input:?} for more \
+             than {:?}; screen:\n{}",
             FOCUS_INPUT_TIMEOUT,
             self.screen_contents(),
         );
@@ -503,6 +574,25 @@ impl PtyCodex {
 
     pub(super) fn screen_contents(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    /// Return the background of the first on-screen cell that starts `text`.
+    fn background_at(&self, text: &str) -> Option<vt100::Color> {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        (0..rows).find_map(|row| {
+            (0..cols).find_map(|col| {
+                let starts_text = chars.iter().zip(col..).all(|(expected, col)| {
+                    screen
+                        .cell(row, col)
+                        .is_some_and(|cell| cell.contents() == expected)
+                });
+                starts_text
+                    .then(|| screen.cell(row, col).map(vt100::Cell::bgcolor))
+                    .flatten()
+            })
+        })
     }
 
     pub(super) fn wait_for_screen(&mut self, text: &str) -> Result<()> {

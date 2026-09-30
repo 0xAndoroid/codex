@@ -26,7 +26,9 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 
+use crossterm::event::ColorReport;
 use crossterm::event::Event;
+use crossterm::style::Color;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -44,6 +46,12 @@ pub type EventResult = std::io::Result<Event>;
 /// Value in production is [`CrosstermEventSource`].
 pub trait EventSource: Send + 'static {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>>;
+
+    /// Ask the terminal to report its default colors as [`ColorReport`] events.
+    ///
+    /// Implementations must only write the query: the replies arrive through [`Self::poll_next`],
+    /// so waiting here would stall the input loop and consume typed keys.
+    fn request_default_colors(&mut self) {}
 }
 
 /// Shared crossterm input state for all [`TuiEventStream`] instances. A single crossterm EventStream
@@ -122,6 +130,17 @@ impl<S: EventSource + Default> EventBroker<S> {
     pub fn resume_events_rx(&self) -> watch::Receiver<()> {
         self.resume_events_tx.subscribe()
     }
+
+    /// Ask the terminal for its default colors unless another program owns terminal input.
+    pub fn request_default_colors(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(events) = state.active_event_source_mut() {
+            events.request_default_colors();
+        }
+    }
 }
 
 /// Real crossterm-backed event source.
@@ -151,6 +170,19 @@ impl EventSource for CrosstermEventSource {
 
         result
     }
+
+    #[cfg(unix)]
+    fn request_default_colors(&mut self) {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout();
+        if let Err(err) = stdout
+            .write_all(super::terminal_colors::DEFAULT_COLOR_QUERY)
+            .and_then(|()| stdout.flush())
+        {
+            tracing::debug!(error = %err, "failed to request terminal default colors");
+        }
+    }
 }
 
 /// TuiEventStream is a struct for reading TUI events (draws and user input).
@@ -166,6 +198,8 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
+    /// OSC 10 reply held until the OSC 11 reply completes the palette.
+    pending_foreground: Option<(u8, u8, u8)>,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -187,6 +221,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
+            pending_foreground: None,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -272,6 +307,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     self.broker.pause_events();
                     let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
                     self.broker.resume_events();
+                    // Mode 2031 was off while suspended, so re-read the palette.
+                    self.broker.request_default_colors();
                     if let Err(err) = suspend_result {
                         tracing::warn!(
                             event = "tui_suspend_failed",
@@ -293,8 +330,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                // Keep the startup-cached palette: querying terminal colors here blocks the
-                // input loop, and a direct probe would discard keys typed during the refresh.
+                // Terminals without mode 2031 still refresh the palette on focus.
+                self.broker.request_default_colors();
                 Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
@@ -302,6 +339,25 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 Some(TuiEvent::FocusLost)
             }
             Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
+            Event::ColorReport(ColorReport::ColorScheme(_)) => {
+                self.broker.request_default_colors();
+                None
+            }
+            Event::ColorReport(ColorReport::ForegroundColor(Color::Rgb { r, g, b })) => {
+                self.pending_foreground = Some((r, g, b));
+                None
+            }
+            Event::ColorReport(ColorReport::BackgroundColor(Color::Rgb { r, g, b })) => {
+                let fg = self
+                    .pending_foreground
+                    .take()
+                    .or_else(crate::terminal_palette::default_fg)?;
+                let colors = crate::terminal_probe::DefaultColors { fg, bg: (r, g, b) };
+                crate::terminal_palette::update_default_colors(colors).then_some(TuiEvent::Draw)
+            }
+            Event::ColorReport(
+                ColorReport::ForegroundColor(_) | ColorReport::BackgroundColor(_),
+            ) => None,
         }
     }
 }
@@ -339,6 +395,7 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::ColorScheme;
     use crossterm::event::Event;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
@@ -358,6 +415,7 @@ mod tests {
     struct FakeEventSource {
         rx: mpsc::UnboundedReceiver<EventResult>,
         tx: mpsc::UnboundedSender<EventResult>,
+        color_requests: usize,
     }
 
     struct FakeEventSourceHandle {
@@ -367,7 +425,11 @@ mod tests {
     impl FakeEventSource {
         fn new() -> Self {
             let (tx, rx) = mpsc::unbounded_channel();
-            Self { rx, tx }
+            Self {
+                rx,
+                tx,
+                color_requests: 0,
+            }
         }
     }
 
@@ -393,11 +455,27 @@ mod tests {
             };
             let _ = source.tx.send(event);
         }
+
+        fn color_requests(&self) -> usize {
+            match &*self
+                .broker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                EventBrokerState::Running(source) => source.color_requests,
+                EventBrokerState::Paused | EventBrokerState::Start => 0,
+            }
+        }
     }
 
     impl EventSource for FakeEventSource {
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
             Pin::new(&mut self.get_mut().rx).poll_recv(cx)
+        }
+
+        fn request_default_colors(&mut self) {
+            self.color_requests += 1;
         }
     }
 
@@ -499,6 +577,7 @@ mod tests {
 
         assert!(matches!(stream.next().await, Some(TuiEvent::FocusGained)));
         assert!(terminal_focused.load(Ordering::Relaxed));
+        assert_eq!(handle.color_requests(), 1);
         assert!(matches!(
             &*broker
                 .state
@@ -633,5 +712,68 @@ mod tests {
             Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
             other => panic!("expected key event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn color_scheme_reports_request_default_colors_between_keys() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let keys = ['a', 'b', 'c'].map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+
+        handle.send(Ok(Event::Key(keys[0])));
+        handle.send(Ok(Event::ColorReport(ColorReport::ColorScheme(
+            ColorScheme::Dark,
+        ))));
+        handle.send(Ok(Event::Key(keys[1])));
+        handle.send(Ok(Event::ColorReport(ColorReport::ColorScheme(
+            ColorScheme::Light,
+        ))));
+        handle.send(Ok(Event::Key(keys[2])));
+
+        let mut delivered = Vec::new();
+        for _ in keys {
+            match stream.next().await {
+                Some(TuiEvent::Key(key)) => delivered.push(key),
+                other => panic!("expected key event, got {other:?}"),
+            }
+        }
+        assert_eq!((delivered, handle.color_requests()), (keys.to_vec(), 2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_color_reports_redraw_only_when_the_palette_changes() {
+        let (broker, _handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let dark = crate::terminal_probe::DefaultColors {
+            fg: (238, 238, 238),
+            bg: (17, 17, 17),
+        };
+        let light = crate::terminal_probe::DefaultColors {
+            fg: (17, 17, 17),
+            bg: (250, 250, 250),
+        };
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb { r, g, b };
+        let reports = [
+            ColorReport::ForegroundColor(rgb(dark.fg)),
+            ColorReport::BackgroundColor(rgb(dark.bg)),
+            // A background report without a pending foreground reuses the cached foreground.
+            ColorReport::BackgroundColor(rgb(dark.bg)),
+            ColorReport::ForegroundColor(rgb(light.fg)),
+            ColorReport::BackgroundColor(rgb(light.bg)),
+        ];
+
+        let events = crate::terminal_palette::with_test_default_colors(dark, || {
+            reports
+                .into_iter()
+                .map(|report| {
+                    format!(
+                        "{:?}",
+                        stream.map_crossterm_event(Event::ColorReport(report))
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(events, ["None", "None", "None", "None", "Some(Draw)"]);
     }
 }
