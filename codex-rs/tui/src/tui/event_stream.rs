@@ -26,7 +26,6 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use std::time::Instant;
 
 use crossterm::event::ColorReport;
 use crossterm::event::ColorScheme;
@@ -48,9 +47,6 @@ pub type EventResult = std::io::Result<Event>;
 /// Delay before re-querying a palette reply that contradicted its mode 2031 report.
 const SCHEME_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// A palette query round unanswered this long no longer holds back new rounds.
-const PALETTE_ROUND_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// Abstraction over a source of terminal events. Allows swapping in a fake for tests.
 /// Value in production is [`CrosstermEventSource`].
 pub trait EventSource: Send + 'static {
@@ -69,19 +65,8 @@ pub trait EventSource: Send + 'static {
 /// This intermediate layer enables dropping/recreating the underlying EventStream (pause/resume) without rebuilding consumers.
 pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
-    palette_round: Mutex<PaletteRound>,
     resume_events_tx: watch::Sender<()>,
     pub(super) size_monitor: Option<SizeMonitor>,
-}
-
-/// The OSC 10/11 query round in flight. Only one runs at a time, so replies of different rounds
-/// never pair; requests during a round coalesce into one more round after it completes.
-#[derive(Default)]
-struct PaletteRound {
-    started: Option<Instant>,
-    requery: bool,
-    foreground: Option<(u8, u8, u8)>,
-    background: Option<(u8, u8, u8)>,
 }
 
 /// Tracks state of underlying [`EventSource`].
@@ -113,7 +98,6 @@ impl<S: EventSource + Default> EventBroker<S> {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {
             state: Mutex::new(EventBrokerState::Start),
-            palette_round: Mutex::default(),
             resume_events_tx,
             size_monitor: None,
         }
@@ -129,11 +113,6 @@ impl<S: EventSource + Default> EventBroker<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = EventBrokerState::Paused;
-        // Replies to a round in flight may reach the program that takes over the terminal.
-        *self
-            .palette_round
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = PaletteRound::default();
     }
 
     /// Create a new instance of the underlying event source
@@ -159,59 +138,13 @@ impl<S: EventSource + Default> EventBroker<S> {
 
     /// Ask the terminal for its default colors unless another program owns terminal input.
     pub fn request_default_colors(&self) {
-        let mut round = self
-            .palette_round
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if round
-            .started
-            .is_some_and(|started| started.elapsed() < PALETTE_ROUND_TIMEOUT)
-        {
-            round.requery = true;
-            return;
-        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(events) = state.active_event_source_mut() {
-            *round = PaletteRound {
-                started: Some(Instant::now()),
-                ..PaletteRound::default()
-            };
             events.request_default_colors();
         }
-    }
-
-    /// Record a reply of the round in flight, returning the palette once both replies arrived.
-    fn default_color_reply(
-        &self,
-        report: ColorReport,
-    ) -> Option<crate::terminal_probe::DefaultColors> {
-        let mut round = self
-            .palette_round
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match report {
-            ColorReport::ForegroundColor(Color::Rgb { r, g, b }) => {
-                round.foreground = Some((r, g, b));
-            }
-            ColorReport::BackgroundColor(Color::Rgb { r, g, b }) => {
-                round.background = Some((r, g, b));
-            }
-            ColorReport::ForegroundColor(_)
-            | ColorReport::BackgroundColor(_)
-            | ColorReport::ColorScheme(_) => return None,
-        }
-        let (Some(fg), Some(bg)) = (round.foreground, round.background) else {
-            return None;
-        };
-        let requery = std::mem::take(&mut *round).requery;
-        drop(round);
-        if requery {
-            self.request_default_colors();
-        }
-        Some(crate::terminal_probe::DefaultColors { fg, bg })
     }
 }
 
@@ -270,6 +203,9 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
+    /// Last OSC 10/11 reply per slot, pairing the first replies while the palette cache is empty.
+    last_fg: Option<(u8, u8, u8)>,
+    last_bg: Option<(u8, u8, u8)>,
     /// Latest mode 2031 report; kept until a newer report replaces it.
     reported_scheme: Option<ColorScheme>,
     /// One delayed re-query per report after a reply contradicted it.
@@ -296,6 +232,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
+            last_fg: None,
+            last_bg: None,
             reported_scheme: None,
             scheme_retry: None,
             scheme_retried: false,
@@ -422,12 +360,18 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 self.broker.request_default_colors();
                 None
             }
-            Event::ColorReport(report) => {
-                let colors = self.broker.default_color_reply(report)?;
+            // Terminals answer in order, so the last reply per slot is current.
+            Event::ColorReport(ColorReport::ForegroundColor(Color::Rgb { r, g, b })) => {
+                self.last_fg = Some((r, g, b));
+                let bg = crate::terminal_palette::default_bg().or(self.last_bg)?;
+                let colors = crate::terminal_probe::DefaultColors { fg: (r, g, b), bg };
+                crate::terminal_palette::update_default_colors(colors).then_some(TuiEvent::Draw)
+            }
+            Event::ColorReport(ColorReport::BackgroundColor(Color::Rgb { r, g, b })) => {
                 // Multiplexers such as herdr relay the report to an unfocused pane but answer its
                 // query with the colors from before the switch; ask once more after they caught up.
                 let stale = self.reported_scheme.is_some_and(|scheme| {
-                    (scheme == ColorScheme::Light) != crate::color::is_light(colors.bg)
+                    (scheme == ColorScheme::Light) != crate::color::is_light((r, g, b))
                 });
                 if !stale {
                     self.scheme_retry = None;
@@ -435,8 +379,14 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     self.scheme_retried = true;
                     self.scheme_retry = Some(Box::pin(tokio::time::sleep(SCHEME_RETRY_DELAY)));
                 }
+                self.last_bg = Some((r, g, b));
+                let fg = crate::terminal_palette::default_fg().or(self.last_fg)?;
+                let colors = crate::terminal_probe::DefaultColors { fg, bg: (r, g, b) };
                 crate::terminal_palette::update_default_colors(colors).then_some(TuiEvent::Draw)
             }
+            Event::ColorReport(
+                ColorReport::ForegroundColor(_) | ColorReport::BackgroundColor(_),
+            ) => None,
         }
     }
 
@@ -827,45 +777,39 @@ mod tests {
                 other => panic!("expected key event, got {other:?}"),
             }
         }
-        // The second report arrives while the first round is unanswered and joins it.
-        assert_eq!((delivered, handle.color_requests()), (keys.to_vec(), 1));
+        assert_eq!((delivered, handle.color_requests()), (keys.to_vec(), 2));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn default_color_replies_pair_in_either_order() {
+    async fn each_reply_updates_its_own_palette_slot() {
         let (broker, _handle, _draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused);
-        let events = crate::terminal_palette::with_test_default_colors(DARK, || {
-            [
+        let (draws, palette) = crate::terminal_palette::with_test_default_colors(DARK, || {
+            let draws = [
+                // An identical reply is a no-op.
+                fg(DARK),
+                // A lone reply updates its slot; the other keeps the cached color.
+                bg(LIGHT),
+                // Overlapping queries interleave their replies; the last reply per slot wins.
+                fg(LIGHT),
                 fg(DARK),
                 bg(DARK),
-                bg(LIGHT),
                 fg(LIGHT),
-                fg(LIGHT),
-                bg(LIGHT),
             ]
-            .map(|event| format!("{:?}", stream.map_crossterm_event(event)))
+            .map(|event| matches!(stream.map_crossterm_event(event), Some(TuiEvent::Draw)));
+            let palette = (
+                crate::terminal_palette::default_fg(),
+                crate::terminal_palette::default_bg(),
+            );
+            (draws, palette)
         });
 
         assert_eq!(
-            events,
-            ["None", "None", "None", "Some(Draw)", "None", "Some(Draw)"]
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unpaired_color_reply_is_dropped_by_the_next_query_round() {
-        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
-        let scheme = Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
-        let events = crate::terminal_palette::with_test_default_colors(DARK, || {
-            [fg(LIGHT), scheme, bg(LIGHT), fg(LIGHT)]
-                .map(|event| format!("{:?}", stream.map_crossterm_event(event)))
-        });
-
-        assert_eq!(
-            (events, handle.color_requests()),
-            (["None", "None", "None", "Some(Draw)"].map(String::from), 1)
+            (draws, palette),
+            (
+                [false, true, true, true, true, true],
+                (Some(LIGHT.fg), Some(DARK.bg))
+            )
         );
     }
 
@@ -886,10 +830,9 @@ mod tests {
                 let light = || Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
                 let mut requests = Vec::new();
                 for events in [
-                    // Focus keeps the report: its stale reply still gets a delayed re-query,
-                    // which joins the round the focus queued.
+                    // Focus keeps the report, so its stale reply still gets one delayed re-query.
                     vec![light(), Event::FocusGained, fg(DARK), bg(DARK)],
-                    // That round's stale reply is not retried again but runs the re-query.
+                    // Another stale reply to the same report is not retried again.
                     vec![fg(DARK), bg(DARK)],
                     vec![fg(LIGHT), bg(LIGHT)],
                     // A reply matching the report is final.
@@ -908,28 +851,7 @@ mod tests {
             })
         });
 
-        assert_eq!(requests, [2, 3, 3, 4, 6]);
-    }
-
-    #[test]
-    fn palette_rounds_never_overlap() {
-        let (broker, handle, _draw_tx, _draw_rx, _terminal_focused) = setup();
-        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb { r, g, b };
-        broker.request_default_colors();
-        let first = broker.default_color_reply(ColorReport::ForegroundColor(rgb(LIGHT.fg)));
-        // Focus during the round coalesces into one more round once this one completes.
-        broker.request_default_colors();
-        let replies = [
-            first,
-            broker.default_color_reply(ColorReport::BackgroundColor(rgb(LIGHT.bg))),
-            broker.default_color_reply(ColorReport::BackgroundColor(rgb(DARK.bg))),
-            broker.default_color_reply(ColorReport::ForegroundColor(rgb(DARK.fg))),
-        ];
-
-        assert_eq!(
-            (replies, handle.color_requests()),
-            ([None, Some(LIGHT), None, Some(DARK)], 2)
-        );
+        assert_eq!(requests, [3, 3, 3, 4, 6]);
     }
 
     const DARK: crate::terminal_probe::DefaultColors = crate::terminal_probe::DefaultColors {

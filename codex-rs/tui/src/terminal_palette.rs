@@ -144,11 +144,22 @@ pub(crate) fn set_default_colors_from_startup_probe(
 
 /// Replace the cached palette with colors the terminal reported, returning whether it changed.
 pub(crate) fn update_default_colors(colors: crate::terminal_probe::DefaultColors) -> bool {
-    let changed = default_colors()
-        != Some(DefaultColors {
-            fg: colors.fg,
-            bg: colors.bg,
-        });
+    let reported = DefaultColors {
+        fg: colors.fg,
+        bg: colors.bg,
+    };
+    let changed = default_colors() != Some(reported);
+    // A test palette scope converges like the process cache without touching it.
+    #[cfg(test)]
+    if TEST_DEFAULT_COLORS.with(|override_colors| {
+        let scoped = override_colors.get().is_some();
+        if scoped {
+            override_colors.set(Some(reported));
+        }
+        scoped
+    }) {
+        return changed;
+    }
     #[cfg(any(unix, windows))]
     if changed {
         set_default_colors_from_startup_probe(Some(colors));

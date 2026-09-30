@@ -40,20 +40,19 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let focus_output_start = terminal.output.len();
     let focus_started = Instant::now();
     terminal.write_input(format!("\u{1b}[I{FOCUS_PROBE_INPUT}").as_bytes())?;
-    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started)?;
-    let focus_output = &terminal.output[focus_output_start..];
-    ensure!(
-        contains_bytes(focus_output, b"\x1b]10;?") && contains_bytes(focus_output, b"\x1b]11;?"),
-        "focus regain did not re-query terminal colors",
-    );
+    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, focus_output_start)?;
 
-    // The first round is still unanswered, so this focus only queues one more round.
     let delayed_input = format!("{FOCUS_PROBE_INPUT}-delayed");
+    let delayed_focus_output_start = terminal.output.len();
     let delayed_focus_started = Instant::now();
     terminal.write_input(b"\x1b[I")?;
     terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
     terminal.write_input(delayed_input.as_bytes())?;
-    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started)?;
+    terminal.wait_for_focus_input(
+        &delayed_input,
+        delayed_focus_started,
+        delayed_focus_output_start,
+    )?;
 
     Ok(())
 }
@@ -483,10 +482,21 @@ impl PtyCodex {
     ///
     /// Focus regain re-queries the palette without waiting for the reply, so the queries must be
     /// written and the input must still arrive.
-    fn wait_for_focus_input(&mut self, input: &str, focus_started: Instant) -> Result<()> {
+    fn wait_for_focus_input(
+        &mut self,
+        input: &str,
+        focus_started: Instant,
+        focus_output_start: usize,
+    ) -> Result<()> {
         while focus_started.elapsed() < FOCUS_INPUT_TIMEOUT {
             self.read_output(Duration::from_millis(/*millis*/ 20))?;
             if self.screen_contains(input) {
+                let focus_output = &self.output[focus_output_start..];
+                ensure!(
+                    contains_bytes(focus_output, b"\x1b]10;?")
+                        && contains_bytes(focus_output, b"\x1b]11;?"),
+                    "focus regain did not re-query terminal colors",
+                );
                 return Ok(());
             }
         }
