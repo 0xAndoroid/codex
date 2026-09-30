@@ -411,7 +411,6 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
     type Item = TuiEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_scheme_retry(cx);
         // approximate fairness + no starvation via round-robin.
         let draw_first = self.poll_draw_first;
         self.poll_draw_first = !self.poll_draw_first;
@@ -432,6 +431,8 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
             }
         }
 
+        // Last, so a retry armed while mapping this poll's replies registers its timer.
+        self.poll_scheme_retry(cx);
         Poll::Pending
     }
 }
@@ -822,28 +823,42 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn stale_reply_to_a_color_scheme_report_is_retried_once() {
-        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
-        let light = || Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
-        let mut requests = Vec::new();
-        for events in [
-            // A light report answered with dark colors gets one delayed re-query.
-            vec![light(), fg(DARK), bg(DARK)],
-            // The re-query's reply is never retried.
-            vec![fg(DARK), bg(DARK)],
-            // A reply matching the report is final.
-            vec![light(), fg(LIGHT), bg(LIGHT)],
-            // A newer report drops the pending re-query.
-            vec![light(), bg(DARK), fg(DARK), light()],
-        ] {
-            for event in events {
-                handle.send(Ok(event));
-            }
-            while let Ok(Some(_)) = timeout(Duration::from_secs(/*secs*/ 1), stream.next()).await {}
-            requests.push(handle.color_requests());
-        }
+    #[test]
+    fn stale_reply_to_a_color_scheme_report_is_retried_once() {
+        // Stale replies repeat the cached palette, so no redraw event polls the stream again.
+        let requests = crate::terminal_palette::with_test_default_colors(DARK, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+                let mut stream = make_stream(broker, draw_rx, terminal_focused);
+                // Like the app loop, only the stream's own wakeups poll it again.
+                let reader = tokio::spawn(async move { while stream.next().await.is_some() {} });
+                let light = || Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
+                let mut requests = Vec::new();
+                for events in [
+                    // A light report answered with dark colors gets one delayed re-query.
+                    vec![light(), fg(DARK), bg(DARK)],
+                    // The re-query's reply is never retried.
+                    vec![fg(DARK), bg(DARK)],
+                    // A reply matching the report is final.
+                    vec![light(), fg(LIGHT), bg(LIGHT)],
+                    // A newer report drops the pending re-query.
+                    vec![light(), bg(DARK), fg(DARK), light()],
+                ] {
+                    for event in events {
+                        handle.send(Ok(event));
+                    }
+                    tokio::time::sleep(Duration::from_secs(/*secs*/ 1)).await;
+                    requests.push(handle.color_requests());
+                }
+                reader.abort();
+                requests
+            })
+        });
 
         assert_eq!(requests, [2, 2, 3, 5]);
     }
