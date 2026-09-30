@@ -371,17 +371,21 @@ impl StreamCore {
         self.rebuild_stable_queue_from_render();
     }
 
-    /// Re-render committed source in the current syntax theme at the same width and mode.
-    ///
-    /// Rows keep their text, so the queue is rebuilt from the same emitted count and the returned
-    /// emitted rows can replace their scrollback copies line for line.
-    fn restyle(&mut self) -> Vec<HyperlinkLine> {
-        if !self.state.collector.committed_source().is_empty() {
-            self.recompute_render(self.width, self.render_mode);
+    /// Width and mode are unchanged, so rows keep their text and the emitted count stays valid.
+    fn restyle(&mut self) -> &[HyperlinkLine] {
+        let source = self.state.collector.committed_source();
+        if !source.is_empty() {
+            self.render.recompute(
+                source,
+                self.width,
+                self.cwd.as_path(),
+                self.render_mode,
+                self.inline_visualization_context.as_ref(),
+            );
             self.rebuild_stable_queue_from_render();
         }
         self.refresh_preview();
-        self.render.lines[..self.emitted_stable_len].to_vec()
+        &self.render.lines[..self.emitted_stable_len.min(self.render.lines.len())]
     }
 
     /// Preserve an emitted source prefix when resizing changes earlier diagrams' heights.
@@ -710,9 +714,8 @@ impl StreamController {
         self.core.set_render_mode(render_mode);
     }
 
-    /// Restyle queued, live, and already emitted rows in the current syntax theme.
     pub(crate) fn restyle(&mut self) {
-        self.emitted_rows.restyle(&self.core.restyle());
+        self.emitted_rows.restyle(self.core.restyle());
     }
 
     fn emit(&mut self, lines: Vec<HyperlinkLine>) -> Option<Box<dyn HistoryCell>> {
@@ -850,7 +853,7 @@ impl PlanStreamController {
         self.core.set_render_mode(render_mode);
     }
 
-    /// Restyle queued and live rows; emitted plan rows are restyled on consolidation.
+    /// Emitted plan rows carry plan decoration and keep their styles until consolidation.
     pub(crate) fn restyle(&mut self) {
         self.core.restyle();
     }

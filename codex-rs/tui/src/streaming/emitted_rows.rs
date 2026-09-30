@@ -15,18 +15,14 @@ pub(super) struct EmittedRows {
 }
 
 impl EmittedRows {
-    /// Keep a handle to the rows of a newly emitted cell.
     pub(super) fn push(&mut self, rows: Vec<HyperlinkLine>) -> Arc<RwLock<Vec<HyperlinkLine>>> {
         let rows = Arc::new(RwLock::new(rows));
         self.cells.push(rows.clone());
         rows
     }
 
-    /// Adopt the styles of `rows`, the emitted prefix re-rendered at the same width.
-    ///
     /// Stops at the first cell whose text differs, such as rows emitted before a mid-stream
-    /// resize; they keep their styles until the stream consolidates into a source-backed cell.
-    /// Equal text keeps every cell's height, so scrollback bookkeeping stays valid.
+    /// resize, which keep their styles until consolidation. Equal text keeps cell heights valid.
     pub(super) fn restyle(&self, mut rows: &[HyperlinkLine]) {
         let text = |line: &HyperlinkLine| {
             line.line
