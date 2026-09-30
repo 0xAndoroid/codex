@@ -25,8 +25,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 
 use crossterm::event::ColorReport;
+use crossterm::event::ColorScheme;
 use crossterm::event::Event;
 use crossterm::style::Color;
 use tokio::sync::broadcast;
@@ -41,6 +43,9 @@ use super::size_monitor::SizeMonitor;
 
 /// Result type produced by an event source.
 pub type EventResult = std::io::Result<Event>;
+
+/// Delay before re-querying a palette reply that contradicted its mode 2031 report.
+const SCHEME_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Abstraction over a source of terminal events. Allows swapping in a fake for tests.
 /// Value in production is [`CrosstermEventSource`].
@@ -198,8 +203,13 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
-    /// OSC 10 reply held until the OSC 11 reply completes the palette.
+    /// OSC 10/11 replies of the current query round, applied together once both arrive.
     pending_foreground: Option<(u8, u8, u8)>,
+    pending_background: Option<(u8, u8, u8)>,
+    /// Scheme announced by the mode 2031 report that started the current query round.
+    reported_scheme: Option<ColorScheme>,
+    /// One delayed re-query after a reply contradicted the reported scheme.
+    scheme_retry: Option<Pin<Box<tokio::time::Sleep>>>,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -222,6 +232,9 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             terminal_focused,
             poll_draw_first: false,
             pending_foreground: None,
+            pending_background: None,
+            reported_scheme: None,
+            scheme_retry: None,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -308,7 +321,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
                     self.broker.resume_events();
                     // Mode 2031 was off while suspended, so re-read the palette.
-                    self.broker.request_default_colors();
+                    self.request_default_colors();
                     if let Err(err) = suspend_result {
                         tracing::warn!(
                             event = "tui_suspend_failed",
@@ -331,7 +344,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
                 // Terminals without mode 2031 still refresh the palette on focus.
-                self.broker.request_default_colors();
+                self.request_default_colors();
                 Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
@@ -339,25 +352,55 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 Some(TuiEvent::FocusLost)
             }
             Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
-            Event::ColorReport(ColorReport::ColorScheme(_)) => {
-                self.broker.request_default_colors();
+            Event::ColorReport(ColorReport::ColorScheme(scheme)) => {
+                self.request_default_colors();
+                self.reported_scheme = Some(scheme);
                 None
             }
             Event::ColorReport(ColorReport::ForegroundColor(Color::Rgb { r, g, b })) => {
                 self.pending_foreground = Some((r, g, b));
-                None
+                self.apply_reported_colors()
             }
             Event::ColorReport(ColorReport::BackgroundColor(Color::Rgb { r, g, b })) => {
-                let fg = self
-                    .pending_foreground
-                    .take()
-                    .or_else(crate::terminal_palette::default_fg)?;
-                let colors = crate::terminal_probe::DefaultColors { fg, bg: (r, g, b) };
-                crate::terminal_palette::update_default_colors(colors).then_some(TuiEvent::Draw)
+                self.pending_background = Some((r, g, b));
+                self.apply_reported_colors()
             }
             Event::ColorReport(
                 ColorReport::ForegroundColor(_) | ColorReport::BackgroundColor(_),
             ) => None,
+        }
+    }
+
+    /// Start a palette query round, dropping unpaired replies and any retry of an earlier round.
+    fn request_default_colors(&mut self) {
+        (self.pending_foreground, self.pending_background) = (None, None);
+        (self.reported_scheme, self.scheme_retry) = (None, None);
+        self.broker.request_default_colors();
+    }
+
+    /// Apply the reported palette once both replies of a query round arrived, in either order.
+    fn apply_reported_colors(&mut self) -> Option<TuiEvent> {
+        let (Some(fg), Some(bg)) = (self.pending_foreground, self.pending_background) else {
+            return None;
+        };
+        (self.pending_foreground, self.pending_background) = (None, None);
+        // Multiplexers such as herdr relay the report to an unfocused pane but answer its query
+        // with the colors from before the switch; ask once more after they caught up.
+        if let Some(scheme) = self.reported_scheme.take()
+            && (scheme == ColorScheme::Light) != crate::color::is_light(bg)
+        {
+            self.scheme_retry = Some(Box::pin(tokio::time::sleep(SCHEME_RETRY_DELAY)));
+        }
+        let colors = crate::terminal_probe::DefaultColors { fg, bg };
+        crate::terminal_palette::update_default_colors(colors).then_some(TuiEvent::Draw)
+    }
+
+    /// Send the pending scheme retry query once its delay has elapsed.
+    fn poll_scheme_retry(&mut self, cx: &mut Context<'_>) {
+        if let Some(retry) = self.scheme_retry.as_mut()
+            && retry.as_mut().poll(cx).is_ready()
+        {
+            self.request_default_colors();
         }
     }
 }
@@ -368,6 +411,7 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
     type Item = TuiEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_scheme_retry(cx);
         // approximate fairness + no starvation via round-robin.
         let draw_first = self.poll_draw_first;
         self.poll_draw_first = !self.poll_draw_first;
@@ -741,39 +785,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn default_color_reports_redraw_only_when_the_palette_changes() {
+    async fn default_color_replies_pair_in_either_order() {
         let (broker, _handle, _draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused);
-        let dark = crate::terminal_probe::DefaultColors {
-            fg: (238, 238, 238),
-            bg: (17, 17, 17),
-        };
-        let light = crate::terminal_probe::DefaultColors {
-            fg: (17, 17, 17),
-            bg: (250, 250, 250),
-        };
-        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb { r, g, b };
-        let reports = [
-            ColorReport::ForegroundColor(rgb(dark.fg)),
-            ColorReport::BackgroundColor(rgb(dark.bg)),
-            // A background report without a pending foreground reuses the cached foreground.
-            ColorReport::BackgroundColor(rgb(dark.bg)),
-            ColorReport::ForegroundColor(rgb(light.fg)),
-            ColorReport::BackgroundColor(rgb(light.bg)),
-        ];
-
-        let events = crate::terminal_palette::with_test_default_colors(dark, || {
-            reports
-                .into_iter()
-                .map(|report| {
-                    format!(
-                        "{:?}",
-                        stream.map_crossterm_event(Event::ColorReport(report))
-                    )
-                })
-                .collect::<Vec<_>>()
+        let events = crate::terminal_palette::with_test_default_colors(DARK, || {
+            [
+                fg(DARK),
+                bg(DARK),
+                bg(LIGHT),
+                fg(LIGHT),
+                fg(LIGHT),
+                bg(LIGHT),
+            ]
+            .map(|event| format!("{:?}", stream.map_crossterm_event(event)))
         });
 
-        assert_eq!(events, ["None", "None", "None", "None", "Some(Draw)"]);
+        assert_eq!(
+            events,
+            ["None", "None", "None", "Some(Draw)", "None", "Some(Draw)"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpaired_color_reply_is_dropped_by_the_next_query_round() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let scheme = Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
+        let events = crate::terminal_palette::with_test_default_colors(DARK, || {
+            [fg(LIGHT), scheme, bg(LIGHT), fg(LIGHT)]
+                .map(|event| format!("{:?}", stream.map_crossterm_event(event)))
+        });
+
+        assert_eq!(
+            (events, handle.color_requests()),
+            (["None", "None", "None", "Some(Draw)"].map(String::from), 1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stale_reply_to_a_color_scheme_report_is_retried_once() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let light = || Event::ColorReport(ColorReport::ColorScheme(ColorScheme::Light));
+        let mut requests = Vec::new();
+        for events in [
+            // A light report answered with dark colors gets one delayed re-query.
+            vec![light(), fg(DARK), bg(DARK)],
+            // The re-query's reply is never retried.
+            vec![fg(DARK), bg(DARK)],
+            // A reply matching the report is final.
+            vec![light(), fg(LIGHT), bg(LIGHT)],
+            // A newer report drops the pending re-query.
+            vec![light(), bg(DARK), fg(DARK), light()],
+        ] {
+            for event in events {
+                handle.send(Ok(event));
+            }
+            while let Ok(Some(_)) = timeout(Duration::from_secs(/*secs*/ 1), stream.next()).await {}
+            requests.push(handle.color_requests());
+        }
+
+        assert_eq!(requests, [2, 2, 3, 5]);
+    }
+
+    const DARK: crate::terminal_probe::DefaultColors = crate::terminal_probe::DefaultColors {
+        fg: (238, 238, 238),
+        bg: (17, 17, 17),
+    };
+    const LIGHT: crate::terminal_probe::DefaultColors = crate::terminal_probe::DefaultColors {
+        fg: (17, 17, 17),
+        bg: (250, 250, 250),
+    };
+
+    fn fg(colors: crate::terminal_probe::DefaultColors) -> Event {
+        let (r, g, b) = colors.fg;
+        Event::ColorReport(ColorReport::ForegroundColor(Color::Rgb { r, g, b }))
+    }
+
+    fn bg(colors: crate::terminal_probe::DefaultColors) -> Event {
+        let (r, g, b) = colors.bg;
+        Event::ColorReport(ColorReport::BackgroundColor(Color::Rgb { r, g, b }))
     }
 }
