@@ -5755,7 +5755,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/openai-oss-forks/crossterm?rev=efa177859fd9623d57b9fe7ae9bf491ae1ac6ec4#efa177859fd9623d57b9fe7ae9bf491ae1ac6ec4"
+source = "git+https://github.com/0xAndoroid/crossterm?rev=98ec52fafec51f0675b891f06030e961280bd1e3#98ec52fafec51f0675b891f06030e961280bd1e3"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",

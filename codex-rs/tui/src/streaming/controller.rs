@@ -58,6 +58,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::StreamState;
+use super::emitted_rows::EmittedRows;
 use super::prose_preview::PreviewMode;
 use super::prose_preview::ProsePreview;
 use super::render::StreamingRender;
@@ -370,6 +371,23 @@ impl StreamCore {
         self.rebuild_stable_queue_from_render();
     }
 
+    /// Width and mode are unchanged, so rows keep their text and the emitted count stays valid.
+    fn restyle(&mut self) -> &[HyperlinkLine] {
+        let source = self.state.collector.committed_source();
+        if !source.is_empty() {
+            self.render.recompute(
+                source,
+                self.width,
+                self.cwd.as_path(),
+                self.render_mode,
+                self.inline_visualization_context.as_ref(),
+            );
+            self.rebuild_stable_queue_from_render();
+        }
+        self.refresh_preview();
+        &self.render.lines[..self.emitted_stable_len.min(self.render.lines.len())]
+    }
+
     /// Preserve an emitted source prefix when resizing changes earlier diagrams' heights.
     fn recompute_render(
         &mut self,
@@ -586,6 +604,7 @@ impl StreamCore {
 pub(crate) struct StreamController {
     core: StreamCore,
     header_emitted: bool,
+    emitted_rows: EmittedRows,
 }
 
 impl StreamController {
@@ -619,6 +638,7 @@ impl StreamController {
         Self {
             core: StreamCore::new(width, cwd, render_mode, inline_visualization_context),
             header_emitted: false,
+            emitted_rows: EmittedRows::default(),
         }
     }
 
@@ -630,6 +650,7 @@ impl StreamController {
     /// markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
         let (remaining, source) = self.core.finalize_remaining();
+        self.emitted_rows.clear();
         if source.is_empty() {
             self.core.reset();
             return (None, None);
@@ -693,17 +714,22 @@ impl StreamController {
         self.core.set_render_mode(render_mode);
     }
 
+    pub(crate) fn restyle(&mut self) {
+        self.emitted_rows.restyle(self.core.restyle());
+    }
+
     fn emit(&mut self, lines: Vec<HyperlinkLine>) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() {
             return None;
         }
-        Some(Box::new(
-            history_cell::AgentMessageCell::new_hyperlink_lines(lines, {
+        Some(Box::new(history_cell::AgentMessageCell::with_shared_rows(
+            self.emitted_rows.push(lines),
+            {
                 let header_emitted = self.header_emitted;
                 self.header_emitted = true;
                 !header_emitted
-            }),
-        ))
+            },
+        )))
     }
 }
 // ---------------------------------------------------------------------------
@@ -825,6 +851,11 @@ impl PlanStreamController {
 
     pub(crate) fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
         self.core.set_render_mode(render_mode);
+    }
+
+    /// Emitted plan rows carry plan decoration and keep their styles until consolidation.
+    pub(crate) fn restyle(&mut self) {
+        self.core.restyle();
     }
 
     fn emit(

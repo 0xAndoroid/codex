@@ -430,6 +430,23 @@ impl App {
         tui: &mut tui::Tui,
         size: ratatui::layout::Size,
     ) -> Result<()> {
+        if self
+            .transcript_reflow
+            .note_palette(crate::terminal_palette::default_colors())
+        {
+            // History, the adaptive syntax theme, the live stream, and status surfaces were styled
+            // for the old terminal colors. An open `/theme` picker keeps its live preview.
+            if self
+                .chat_widget
+                .selected_index_for_present_view(crate::theme_picker::THEME_PICKER_VIEW_ID)
+                .is_none()
+            {
+                self.restore_runtime_theme_from_config();
+            }
+            self.chat_widget.restyle_active_streams();
+            self.refresh_status_line();
+            self.schedule_immediate_resize_reflow(tui);
+        }
         self.flush_native_history(tui);
         if tui.is_owned_screen() {
             let width = self.transcript_reflow.note_width(size.width);

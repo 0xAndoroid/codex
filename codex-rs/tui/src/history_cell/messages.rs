@@ -11,6 +11,9 @@ use crate::terminal_hyperlinks::remap_source_wrapped_line;
 use crate::wrapping::url_preserving_wrap_options;
 use crate::wrapping::word_wrap_line_with_source;
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
@@ -424,20 +427,26 @@ impl HistoryCell for ReasoningSummaryCell {
 
 #[derive(Debug)]
 pub(crate) struct AgentMessageCell {
-    lines: Vec<HyperlinkLine>,
+    /// Rows shared with the emitting stream, which restyles them after a terminal palette change.
+    lines: Arc<RwLock<Vec<HyperlinkLine>>>,
     is_first_line: bool,
 }
 
 impl AgentMessageCell {
     #[cfg(test)]
     pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
-        Self {
-            lines: plain_hyperlink_lines(lines),
-            is_first_line,
-        }
+        Self::new_hyperlink_lines(plain_hyperlink_lines(lines), is_first_line)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_hyperlink_lines(lines: Vec<HyperlinkLine>, is_first_line: bool) -> Self {
+        Self::with_shared_rows(Arc::new(RwLock::new(lines)), is_first_line)
+    }
+
+    pub(crate) fn with_shared_rows(
+        lines: Arc<RwLock<Vec<HyperlinkLine>>>,
+        is_first_line: bool,
+    ) -> Self {
         Self {
             lines,
             is_first_line,
@@ -452,7 +461,8 @@ impl HistoryCell for AgentMessageCell {
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let mut wrapped = Vec::new();
-        for (index, line) in self.lines.iter().enumerate() {
+        let lines = self.lines.read().unwrap_or_else(PoisonError::into_inner);
+        for (index, line) in lines.iter().enumerate() {
             let initial_indent = if index == 0 && self.is_first_line {
                 "• ".dim().into()
             } else {
@@ -477,7 +487,8 @@ impl HistoryCell for AgentMessageCell {
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        plain_lines(visible_lines(self.lines.clone()))
+        let lines = self.lines.read().unwrap_or_else(PoisonError::into_inner);
+        plain_lines(visible_lines(lines.clone()))
     }
 
     fn is_stream_continuation(&self) -> bool {

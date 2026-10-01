@@ -1,4 +1,5 @@
-//! Tracks when Codex-owned transcript scrollback must be repaired after terminal resize.
+//! Tracks when Codex-owned transcript scrollback must be repaired after terminal resize or a
+//! terminal palette change.
 //!
 //! Terminal scrollback is not a retained widget tree: once Codex writes wrapped lines into the
 //! terminal, the terminal owns those rows. Width resize reflow treats the in-memory transcript cells
@@ -14,6 +15,8 @@
 
 use std::time::Duration;
 use std::time::Instant;
+
+use crate::terminal_palette::DefaultColors;
 
 pub(crate) const TRANSCRIPT_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75);
 
@@ -32,6 +35,8 @@ pub(crate) struct TranscriptReflowState {
     visible_history_rows: Option<u16>,
     ran_during_stream: bool,
     resize_requested_during_stream: bool,
+    /// Terminal palette seen by the last draw; `None` until the first draw observes one.
+    last_observed_palette: Option<Option<DefaultColors>>,
 }
 
 impl TranscriptReflowState {
@@ -39,9 +44,13 @@ impl TranscriptReflowState {
     ///
     /// Call this when the app discards the transcript state that pending reflow work would have
     /// rebuilt. Leaving stale deadlines behind would make a later draw attempt to rebuild history
-    /// from unrelated cells.
+    /// from unrelated cells. The palette baseline survives: the runtime theme was resolved against
+    /// it, so a palette change across the reset must still re-resolve the theme.
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            last_observed_palette: self.last_observed_palette,
+            ..Self::default()
+        };
     }
 
     /// Cache the history rows left above the composer for the current terminal size.
@@ -68,6 +77,16 @@ impl TranscriptReflowState {
             changed: previous_width.is_some_and(|previous| previous != width),
             initialized: previous_width.is_none(),
         }
+    }
+
+    /// Record the terminal palette observed during a draw and report whether it changed.
+    ///
+    /// Like width tracking, the first observation only initializes the state: emitted history
+    /// already matches the palette it was rendered with.
+    pub(crate) fn note_palette(&mut self, palette: Option<DefaultColors>) -> bool {
+        self.last_observed_palette
+            .replace(palette)
+            .is_some_and(|previous| previous != palette)
     }
 
     /// Return whether scrollback still needs to be rebuilt at `width`.

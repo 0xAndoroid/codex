@@ -88,7 +88,7 @@ fn best_color_for_color_level(target: (u8, u8, u8), color_level: StdoutColorLeve
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DefaultColors {
     fg: (u8, u8, u8),
     bg: (u8, u8, u8),
@@ -140,6 +140,31 @@ pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
     imp::set_default_colors_from_startup_probe(colors);
+}
+
+/// Replace the cached palette with colors the terminal reported, returning whether it changed.
+pub(crate) fn update_default_colors(colors: crate::terminal_probe::DefaultColors) -> bool {
+    let reported = DefaultColors {
+        fg: colors.fg,
+        bg: colors.bg,
+    };
+    let changed = default_colors() != Some(reported);
+    // A test palette scope converges like the process cache without touching it.
+    #[cfg(test)]
+    if TEST_DEFAULT_COLORS.with(|override_colors| {
+        let scoped = override_colors.get().is_some();
+        if scoped {
+            override_colors.set(Some(reported));
+        }
+        scoped
+    }) {
+        return changed;
+    }
+    #[cfg(any(unix, windows))]
+    if changed {
+        set_default_colors_from_startup_probe(Some(colors));
+    }
+    changed
 }
 
 #[cfg(all(unix, not(test)))]

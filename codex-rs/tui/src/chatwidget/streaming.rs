@@ -685,6 +685,16 @@ impl ChatWidget {
         self.clear_active_stream_tail()
     }
 
+    pub(crate) fn restyle_active_streams(&mut self) {
+        if let Some(controller) = self.stream_controller.as_mut() {
+            controller.restyle();
+        }
+        if let Some(controller) = self.plan_stream_controller.as_mut() {
+            controller.restyle();
+        }
+        self.sync_active_stream_tail();
+    }
+
     pub(super) fn clear_active_stream_tail(&mut self) -> bool {
         if self.active_cell_is_stream_tail() {
             self.transcript.active_cell = None;
