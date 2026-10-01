@@ -44,9 +44,13 @@ impl TranscriptReflowState {
     ///
     /// Call this when the app discards the transcript state that pending reflow work would have
     /// rebuilt. Leaving stale deadlines behind would make a later draw attempt to rebuild history
-    /// from unrelated cells.
+    /// from unrelated cells. The palette baseline survives: the runtime theme was resolved against
+    /// it, so a palette change across the reset must still re-resolve the theme.
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            last_observed_palette: self.last_observed_palette,
+            ..Self::default()
+        };
     }
 
     /// Cache the history rows left above the composer for the current terminal size.

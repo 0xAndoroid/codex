@@ -404,3 +404,20 @@ async fn terminal_palette_changes_keep_the_theme_picker_preview_until_cancel() -
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn terminal_palette_change_across_a_transcript_reset_reresolves_the_theme() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.local_settings.tui.theme = None;
+
+    let (_, revision) = draw_with_palette(&mut app, &mut tui, DARK_PALETTE)?;
+    app.reset_transcript_state_after_clear();
+    let light = draw_with_palette(&mut app, &mut tui, LIGHT_PALETTE)?;
+
+    assert_eq!(
+        light,
+        (bundled_theme_name("catppuccin-latte"), revision + 1)
+    );
+    Ok(())
+}
